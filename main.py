@@ -5,7 +5,7 @@ from typing import Optional, Literal
 import pandas as pd
 import uuid
 import os
-
+print("🧨 main.oy loaded")
 app = FastAPI()
 
 app.add_middleware(
