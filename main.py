@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional, Literal
@@ -10,12 +10,30 @@ print("🧨 main.py loaded")
 
 app = FastAPI()
 
+# -------------------------
+# CORS (GitHub Pages + local)
+# -------------------------
+# GitHub Pages runs on HTTPS, so your API must allow that origin.
+# Also keep localhost for local dev.
+ALLOWED_ORIGINS = [
+    "https://magrebiali.github.io",  # your GitHub Pages origin
+    "http://localhost:5500",         # common local static server
+    "http://127.0.0.1:5500",
+    "http://localhost:8000",         # if you ever serve UI locally (optional)
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later restrict to your GitHub Pages domain
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional: handle preflight explicitly (rarely needed, but helps debugging)
+@app.options("/{path:path}")
+async def preflight(path: str, request: Request):
+    return JSONResponse(content={"ok": True})
 
 TMP_DIR = "tmp"
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -184,20 +202,18 @@ def _audit_duplicate_groups(
     Compute audit-friendly duplicate annotations.
 
     Adds:
-      - DuplicateGroupID (same for all rows in group)
-      - DuplicateCount (size of the group)
-      - DuplicateFirstSeenRow (1-based row number for first occurrence)
-      - DuplicateRankInGroup (1..N in original row order within the group)
-      - DuplicateFlag (Unique / Kept / Duplicate)
-      - DuplicateKey (DISPLAY key - human-friendly)
+      - DuplicateGroupID
+      - DuplicateCount
+      - DuplicateFirstSeenRow
+      - DuplicateRankInGroup
+      - DuplicateFlag
+      - DuplicateKey (DISPLAY key)
     """
     out = df.copy()
     out_index = out.index
 
-    # The key used for grouping (can be modified to prevent blanks grouping)
     internal_key = group_key.fillna("").astype(str)
 
-    # The key shown to the user (never show internal blank hack strings)
     if display_key is None:
         display_key = group_key.fillna("").astype(str)
     else:
@@ -205,28 +221,22 @@ def _audit_duplicate_groups(
 
     is_blank = internal_key.eq("")
 
-    # Optional: blanks should not form duplicate groups
     if treat_blank_as_unique:
         internal_key = internal_key.where(~is_blank, other="__BLANK__ROW__" + out_index.astype(str))
 
     counts = internal_key.map(internal_key.value_counts())
     in_dup_group = counts.gt(1)
 
-    # First-seen row number (1-based), per group
     row_number = pd.Series(range(1, len(out) + 1), index=out_index)
     first_seen = row_number.groupby(internal_key).transform("min")
 
-    # Rank within group in original order (1..N)
     rank_in_group = row_number.groupby(internal_key).rank(method="first").astype(int)
-    # Blank out rank for uniques
     rank_in_group = rank_in_group.where(in_dup_group, other=pd.NA)
 
-    # Group IDs
     codes, _ = pd.factorize(internal_key, sort=False)
     group_id_str = pd.Series(codes, index=out_index).map(lambda x: f"G{(x+1):06d}")
     group_id_str = group_id_str.where(in_dup_group, other="")
 
-    # Flagging based on keep_policy
     if keep_policy == "mark_all":
         flag = pd.Series("Unique", index=out_index)
         flag = flag.where(~in_dup_group, other="Duplicate")
@@ -243,8 +253,6 @@ def _audit_duplicate_groups(
     else:
         raise ValueError("keep_policy must be: mark_all | keep_first | keep_last")
 
-    # Clean display for blank keys
-    # (show blank, not internal __BLANK__ROW__)
     display_key = display_key.where(~is_blank, other="")
 
     out["DuplicateKey"] = display_key
@@ -257,27 +265,19 @@ def _audit_duplicate_groups(
     return out
 
 
-# =========================
-# Deduplication Endpoint
-# =========================
 @app.post("/dedupe")
 async def dedupe(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     mode: DedupeMode = Form(...),
 
-    # Options
     keep_policy: KeepPolicy = Form("mark_all"),
     ignore_case: bool = Form(False),
     ignore_whitespace: bool = Form(False),
 
-    # Used when mode="column"
     key_column: Optional[str] = Form(None),
-
-    # Used when mode="row"
-    ignore_columns: Optional[str] = Form(None),  # comma-separated list
+    ignore_columns: Optional[str] = Form(None),
 ):
-    # 1) Read file
     try:
         df = read_table(file)
     except Exception:
@@ -294,7 +294,6 @@ async def dedupe(
             content={"error": "keep_policy must be: mark_all | keep_first | keep_last"},
         )
 
-    # 2) Build group key depending on mode
     if mode == "column":
         if not key_column or not str(key_column).strip():
             return JSONResponse(status_code=400, content={"error": "key_column is required when mode='column'."})
@@ -311,8 +310,8 @@ async def dedupe(
 
         out = _audit_duplicate_groups(
             df=df,
-            group_key=col_norm,          # internal grouping uses normalized
-            display_key=col_raw,         # show original values (cleaned for blanks)
+            group_key=col_norm,
+            display_key=col_raw,
             keep_policy=keep_policy,
             treat_blank_as_unique=True,
         )
@@ -339,7 +338,7 @@ async def dedupe(
         out = _audit_duplicate_groups(
             df=df,
             group_key=row_keys,
-            display_key=None,  # default to group_key for row mode
+            display_key=None,
             keep_policy=keep_policy,
             treat_blank_as_unique=False,
         )
@@ -348,7 +347,6 @@ async def dedupe(
     else:
         return JSONResponse(status_code=400, content={"error": "mode must be either 'column' or 'row'."})
 
-    # 3) Output workbook — ONLY All_Rows
     file_id = str(uuid.uuid4())
     output_path = os.path.join(TMP_DIR, f"dedupe_{file_id}.xlsx")
 
